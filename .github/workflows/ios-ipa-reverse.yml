@@ -1,30 +1,10 @@
-name: iOS IPA Reverse Analysis
+name: iOS App Bundle Deep Reverse Analysis
 
 on:
   push:
-    
+    paths:
+      - '*.ipa'
   workflow_dispatch:
-    inputs:
-      ipa_path:
-        description: 'IPA 在仓库中的路径，例如 app.ipa'
-        required: true
-        default: 'app.ipa'
-        type: string
-      include_raw_binaries:
-        description: '把主程序、Framework 和扩展的原始 Mach-O 一并放入 Artifact（文件可能很大且含专有代码）'
-        required: false
-        default: false
-        type: boolean
-      full_disassembly:
-        description: '导出每个 Mach-O 的完整 ARM64 __text 反汇编（耗时及 Artifact 体积会明显增加）'
-        required: false
-        default: true
-        type: boolean
-      extract_assets:
-        description: '从 Assets.car 提取图片/矢量/文档资源（文件数量和 Artifact 体积会增加）'
-        required: false
-        default: true
-        type: boolean
 
 permissions:
   contents: read
@@ -39,10 +19,9 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 120
     env:
-      INPUT_IPA_PATH: ${{ github.event.inputs.ipa_path }}
-      INCLUDE_RAW_BINARIES: ${{ github.event.inputs.include_raw_binaries }}
-      FULL_DISASSEMBLY: ${{ github.event.inputs.full_disassembly || 'true' }}
-      EXTRACT_ASSETS: ${{ github.event.inputs.extract_assets || 'true' }}
+      INCLUDE_RAW_BINARIES: 'false'
+      FULL_DISASSEMBLY: 'true'
+      EXTRACT_ASSETS: 'true'
       WORK_DIR: ${{ runner.temp }}/ipa-reverse
 
     steps:
@@ -50,12 +29,12 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 1
+          lfs: true
 
       - name: Install analysis tools
         shell: bash
         run: |
           set -euo pipefail
-          brew update
           brew install ipsw radare2
           {
             echo "PYTHON=$(command -v python3)"
@@ -66,32 +45,36 @@ jobs:
           r2 -v 2>&1 | head -n 1 >> "$GITHUB_STEP_SUMMARY" || true
           python3 --version >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Locate and safely extract IPA
+      - name: Find root IPA and safely extract the .app bundle
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "$WORK_DIR/input" "$WORK_DIR/extracted" "$WORK_DIR/analysis"
 
-          requested="${INPUT_IPA_PATH:-app.ipa}"
-          if [[ "$requested" = /* ]]; then
-            candidate="$requested"
+          # 只搜索仓库根目录：优先使用 app.ipa；否则必须恰好只有一个 .ipa。
+          if [[ -f "$GITHUB_WORKSPACE/app.ipa" ]]; then
+            candidate="$GITHUB_WORKSPACE/app.ipa"
           else
-            candidate="$GITHUB_WORKSPACE/$requested"
+            ipa_files=()
+            while IFS= read -r ipa_path; do
+              ipa_files+=("$ipa_path")
+            done < <(find "$GITHUB_WORKSPACE" -maxdepth 1 -type f -iname '*.ipa' -print | sort)
+            if [[ "${#ipa_files[@]}" -eq 0 ]]; then
+              echo '::error::仓库根目录没有找到 .ipa 文件。请把 IPA 直接放在仓库根目录后重新运行。'
+              exit 1
+            elif [[ "${#ipa_files[@]}" -gt 1 ]]; then
+              echo '::error::仓库根目录发现多个 IPA。请只保留一个，或将其中一个命名为 app.ipa。'
+              printf '%s\n' "${ipa_files[@]}"
+              exit 1
+            fi
+            candidate="${ipa_files[0]}"
           fi
 
-          if [[ ! -f "$candidate" ]]; then
-            candidate="$(find "$GITHUB_WORKSPACE" -maxdepth 5 -type f -name '*.ipa' -print -quit || true)"
-          fi
-          if [[ -z "$candidate" || ! -f "$candidate" ]]; then
-            echo '::error::没有找到 IPA。请把 IPA 放进仓库，或在 workflow_dispatch 中填写 ipa_path。'
-            exit 1
-          fi
-
-          echo "Using IPA: $(basename "$candidate")"
+          echo "Using root IPA: $(basename "$candidate")"
           echo "IPA_FILE=$candidate" >> "$GITHUB_ENV"
 
-          # 使用 Python 校验 ZIP 内路径，避免将 ../ 路径写出解压目录。
-          python3 - "$candidate" "$WORK_DIR/extracted" <<'PY'
+          # 校验 ZIP 中的路径，防止 ../ 路径穿越。
+          "$PYTHON" - "$candidate" "$WORK_DIR/extracted" <<'PY'
           import pathlib, sys, zipfile
           archive = pathlib.Path(sys.argv[1])
           root = pathlib.Path(sys.argv[2]).resolve()
@@ -124,16 +107,24 @@ jobs:
             exit 1
           fi
 
-          app_dir="$(find "$payload" -maxdepth 1 -type d -name '*.app' -print -quit)"
-          if [[ -z "$app_dir" ]]; then
-            echo '::error::Payload 中没有找到主 .app 包。'
+          app_candidates=()
+          while IFS= read -r app_path; do
+            app_candidates+=("$app_path")
+          done < <(find "$payload" -maxdepth 1 -type d -name '*.app' -print | sort)
+          if [[ "${#app_candidates[@]}" -eq 0 ]]; then
+            echo '::error::Payload 根目录中没有找到 .app 包。'
+            exit 1
+          elif [[ "${#app_candidates[@]}" -gt 1 ]]; then
+            echo '::error::Payload 中发现多个顶层 .app，无法安全判断哪个是主 App。'
+            printf '%s\n' "${app_candidates[@]}"
             exit 1
           fi
+          app_dir="${app_candidates[0]}"
 
           info_plist="$app_dir/Info.plist"
           executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$info_plist" 2>/dev/null || true)"
           if [[ -z "$executable" || ! -f "$app_dir/$executable" ]]; then
-            echo '::error::无法通过 Info.plist 的 CFBundleExecutable 定位主程序。'
+            echo '::error::无法通过 .app/Info.plist 的 CFBundleExecutable 定位主程序。'
             exit 1
           fi
 
@@ -150,7 +141,8 @@ jobs:
             echo "ANALYSIS_DIR=$WORK_DIR/analysis"
           } >> "$GITHUB_ENV"
 
-          echo "### IPA identified" >> "$GITHUB_STEP_SUMMARY"
+          echo '### IPA identified' >> "$GITHUB_STEP_SUMMARY"
+          echo "- Root IPA: \`$(basename "$candidate")\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- App bundle: \`$(basename "$app_dir")\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- Executable: \`$executable\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- Main binary: $(file -b "$main_binary")" >> "$GITHUB_STEP_SUMMARY"
@@ -304,6 +296,100 @@ jobs:
           find "$APP_DIR" -type f \( -name 'PrivacyInfo.xcprivacy' -o -name '*.entitlements' \) -print \
             > "$ANALYSIS_DIR/signing/privacy_and_entitlement_files.txt" || true
 
+      - name: Recursively collect all resources from inside .app
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$ANALYSIS_DIR/resources/app_bundle" "$ANALYSIS_DIR/resources/plist_decoded"
+
+          # 逐个扫描 .app 内的文件：保留图片、视频、音频、字体、数据库、模型、脚本、配置、nib 等资源；
+          # 不复制 Mach-O 可执行文件、代码签名目录及 provisioning profile。
+          "$PYTHON" - "$APP_DIR" "$ANALYSIS_DIR/resources" <<'PY'
+          import csv, json, os, pathlib, plistlib, shutil, subprocess, sys
+          app = pathlib.Path(sys.argv[1]).resolve()
+          out = pathlib.Path(sys.argv[2]).resolve()
+          mirror = out / 'app_bundle'
+          decoded = out / 'plist_decoded'
+          mirror.mkdir(parents=True, exist_ok=True)
+          decoded.mkdir(parents=True, exist_ok=True)
+
+          macho_magics = {
+              b'\xfe\xed\xfa\xce', b'\xce\xfa\xed\xfe',
+              b'\xfe\xed\xfa\xcf', b'\xcf\xfa\xed\xfe',
+              b'\xca\xfe\xba\xbe', b'\xbe\xba\xfe\xca',
+              b'\xca\xfe\xba\xbf', b'\xbf\xba\xfe\xca',
+          }
+          excluded_dirs = {'_CodeSignature', 'SC_Info'}
+          records = []
+          copied = 0
+          skipped_macho = 0
+          skipped_private = 0
+
+          for src in sorted(app.rglob('*')):
+              try:
+                  if not src.is_file():
+                      continue
+                  rel = src.relative_to(app)
+                  if any(part in excluded_dirs for part in rel.parts):
+                      skipped_private += 1
+                      continue
+                  if src.name == 'embedded.mobileprovision':
+                      skipped_private += 1
+                      continue
+                  size = src.stat().st_size
+                  with src.open('rb') as fh:
+                      magic = fh.read(4)
+                  if magic in macho_magics:
+                      skipped_macho += 1
+                      records.append({'path': str(rel), 'size': size, 'kind': 'Mach-O (analyzed separately)', 'copied': False})
+                      continue
+                  target = mirror / rel
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copy2(src, target)
+                  copied += 1
+                  suffix = src.suffix.lower()
+                  kind = suffix or '[no extension]'
+                  records.append({'path': str(rel), 'size': size, 'kind': kind, 'copied': True})
+
+                  if suffix in {'.plist', '.strings', '.stringsdict', '.entitlements', '.xcprivacy'}:
+                      try:
+                          with src.open('rb') as fh:
+                              value = plistlib.load(fh)
+                          dest = decoded / (str(rel).replace(os.sep, '__') + '.json')
+                          dest.write_text(json.dumps(value, ensure_ascii=False, indent=2, default=str), encoding='utf-8')
+                      except Exception:
+                          pass
+              except (OSError, ValueError) as exc:
+                  records.append({'path': str(src), 'error': str(exc), 'copied': False})
+
+          with (out / 'complete_resource_manifest.csv').open('w', newline='', encoding='utf-8-sig') as fh:
+              writer = csv.DictWriter(fh, fieldnames=['path', 'size', 'kind', 'copied', 'error'])
+              writer.writeheader()
+              for row in records:
+                  writer.writerow(row)
+          summary = {
+              'app_bundle': app.name,
+              'files_scanned': len(records),
+              'resource_files_copied': copied,
+              'mach_o_files_skipped_because_analyzed_separately': skipped_macho,
+              'signature_or_profile_files_skipped': skipped_private,
+              'copied_resource_bytes': sum(r.get('size', 0) for r in records if r.get('copied')),
+          }
+          (out / 'resource_copy_summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+          print(json.dumps(summary, ensure_ascii=False, indent=2))
+          PY
+
+          # 另存编译 storyboard/nib 的可读对象输出；不支持的格式会写入日志，不中断整条流程。
+          if command -v ibtool >/dev/null 2>&1; then
+            mkdir -p "$ANALYSIS_DIR/resources/ibtool"
+            while IFS= read -r -d '' nib; do
+              relative="${nib#"$APP_DIR"/}"
+              safe_name="$(printf '%s' "$relative" | sed 's#[^A-Za-z0-9._-]#_#g')"
+              ibtool --objects --output-format human-readable-text "$nib" \
+                > "$ANALYSIS_DIR/resources/ibtool/${safe_name}.txt" 2> "$ANALYSIS_DIR/resources/ibtool/${safe_name}.stderr.txt" || true
+            done < <(find "$APP_DIR" -type f -name '*.nib' -print0)
+          fi
+
       - name: Inspect and extract compiled Assets.car catalogs
         shell: bash
         run: |
@@ -371,9 +457,22 @@ jobs:
               grep -A 6 -E 'LC_ENCRYPTION_INFO(_64)?' "$out/load_commands_${arch}.txt" \
                 > "$out/encryption_${arch}.txt" || echo 'No LC_ENCRYPTION_INFO load command found.' > "$out/encryption_${arch}.txt"
 
-              ipsw macho info "$binary" --arch "$arch" --header --loads --ent --objc \
-                --objc-refs --symbols --sig --fixups --starts --demangle --json \
+              ipsw macho info "$binary" --arch "$arch" --header --loads --json \
                 > "$out/ipsw_macho_${arch}.json" 2> "$out/ipsw_macho_${arch}.stderr.txt" || true
+              ipsw macho info "$binary" --arch "$arch" --ent \
+                > "$out/entitlements_${arch}.plist" 2> "$out/entitlements_${arch}.stderr.txt" || true
+              ipsw macho info "$binary" --arch "$arch" --objc \
+                > "$out/objc_metadata_${arch}.txt" 2> "$out/objc_metadata_${arch}.stderr.txt" || true
+              ipsw macho info "$binary" --arch "$arch" --objc-refs \
+                > "$out/objc_references_${arch}.txt" 2> "$out/objc_references_${arch}.stderr.txt" || true
+              ipsw macho info "$binary" --arch "$arch" --symbols \
+                > "$out/ipsw_symbols_${arch}.txt" 2> "$out/ipsw_symbols_${arch}.stderr.txt" || true
+              ipsw macho info "$binary" --arch "$arch" --sig \
+                > "$out/code_signature_${arch}.txt" 2> "$out/code_signature_${arch}.stderr.txt" || true
+              ipsw macho info "$binary" --arch "$arch" --fixups \
+                > "$out/fixups_${arch}.txt" 2> "$out/fixups_${arch}.stderr.txt" || true
+              ipsw macho info "$binary" --arch "$arch" --starts \
+                > "$out/function_starts_${arch}.txt" 2> "$out/function_starts_${arch}.stderr.txt" || true
 
               if [[ "${FULL_DISASSEMBLY:-true}" == "true" ]]; then
                 # 新系统常见 __TEXT_EXEC.__text；兼容旧布局时回退到 __TEXT.__text。
@@ -561,19 +660,22 @@ jobs:
                      f"- Objective-C dump 目录：`objc/`（若有运行时元数据且未被剥离，可生成头文件）",
                      f"- Swift dump 目录：`swift/`（若 Swift 元数据可识别，可生成类型/协议信息）",
                      '', '## 6. 签名与安全配置',
-                     '- 签名摘要：`signing/codesign_details.txt`',
-                     '- Entitlements：`signing/entitlements.plist`',
-                     '- Provisioning Profile 摘要：`signing/profile_summary.json`（若 IPA 含 profile）',
+                     '- 签名摘要：`signing/` 目录下每个 App/Extension 的独立 codesign 详情文件',
+                     '- Entitlements：`signing/` 目录下每个 App/Extension 的独立 Entitlements plist',
+                     '- Provisioning Profile 摘要：`signing/profile_summary.json`（若 IPA 含 profile；原始 profile 不上传）',
                      '- 字符串输出已做常见凭证模式的启发式脱敏；仍需人工检查，脱敏不能保证识别所有秘密。',
                      '- `cryptid=1` 表示对应 slice 标记为加密；本流程只检测，不尝试解密或绕过保护。',
                      '', '## 7. 输出目录说明',
                      '- `macho/`：Mach-O 头、Load Commands、依赖、导入/导出、符号、radare2 分析、加密标记及完整反汇编 JSON（启用时）',
                      '- `objc/`：Objective-C 类 dump 与可导出的 headers',
                      '- `swift/`：Swift 元数据 dump、demangle 信息及 headers（若工具能识别）',
-                     '- `metadata/`：Bundle 信息、资源类型统计、资源清单和可解析的 `.strings` / `.stringsdict` 本地化文本',
-                     '- `assets/`：Assets.car 元数据、可解码的图像/矢量/文档 rendition 和提取日志',
+                     '- `metadata/`：Bundle 信息、资源类型统计和可解析的 `.strings` / `.stringsdict` 本地化文本',
+                     '- `resources/app_bundle/`：从 `.app` 内递归复制的全部非 Mach-O 资源文件，保留原目录结构',
+                     '- `resources/plist_decoded/`：可解析的 plist、strings、entitlements、PrivacyInfo 等转成 JSON',
+                     '- `resources/complete_resource_manifest.csv`：`.app` 内每个文件的路径、大小、类型和复制状态',
+                     '- `assets/`：所有 `.car` 目录的元数据、可解码的图像/矢量/文档 rendition 和提取日志',
                      '- `signing/`：签名、Entitlements、隐私清单路径和 profile 摘要',
-                     '- `raw_binaries/`：仅在手动启用 include_raw_binaries 时包含原始 Mach-O',
+                     '- `raw_binaries/`：默认不复制原始 Mach-O，避免重复上传专有可执行文件',
                      '', '## 8. 重要限制',
                      '- 这不是源码还原器，不能恢复原始变量名、注释、完整控制流结构或服务端代码。',
                      '- App Store/FairPlay 加密二进制、符号剥离、Swift 优化、混淆及运行时解密会造成分析缺口。',
@@ -587,13 +689,13 @@ jobs:
           - Mach-O binaries analyzed: **$MACHO_BINARY_COUNT**
           - Main app: \`$(basename "$APP_DIR")\`
           - Report: \`ULTIMATE_REPORT.md\`
-          - Artifact: **ios-ipa-reverse-analysis**
+          - Artifact: **ios-app-deep-reverse-analysis**
           EOF
 
       - name: Upload analysis artifact
         uses: actions/upload-artifact@v7
         with:
-          name: ios-ipa-reverse-analysis
+          name: ios-app-deep-reverse-analysis
           path: ${{ runner.temp }}/ipa-reverse/analysis/
           if-no-files-found: error
           compression-level: 6
