@@ -1,1 +1,602 @@
+name: iOS IPA Reverse Analysis
 
+on:
+  push:
+    paths:
+      - '**/*.ipa'
+      - '.github/workflows/ios-ipa-reverse.yml'
+  workflow_dispatch:
+    inputs:
+      ipa_path:
+        description: 'IPA 在仓库中的路径，例如 app.ipa'
+        required: true
+        default: 'app.ipa'
+        type: string
+      include_raw_binaries:
+        description: '把主程序、Framework 和扩展的原始 Mach-O 一并放入 Artifact（文件可能很大且含专有代码）'
+        required: false
+        default: false
+        type: boolean
+      full_disassembly:
+        description: '导出每个 Mach-O 的完整 ARM64 __text 反汇编（耗时及 Artifact 体积会明显增加）'
+        required: false
+        default: true
+        type: boolean
+      extract_assets:
+        description: '从 Assets.car 提取图片/矢量/文档资源（文件数量和 Artifact 体积会增加）'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ipa-reverse-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  reverse-analysis:
+    name: Static reverse analysis
+    runs-on: macos-latest
+    timeout-minutes: 120
+    env:
+      INPUT_IPA_PATH: ${{ github.event.inputs.ipa_path }}
+      INCLUDE_RAW_BINARIES: ${{ github.event.inputs.include_raw_binaries }}
+      FULL_DISASSEMBLY: ${{ github.event.inputs.full_disassembly || 'true' }}
+      EXTRACT_ASSETS: ${{ github.event.inputs.extract_assets || 'true' }}
+      WORK_DIR: ${{ runner.temp }}/ipa-reverse
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Install analysis tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew update
+          brew install ipsw radare2
+          {
+            echo "PYTHON=$(command -v python3)"
+            echo "PATH=$(brew --prefix)/bin:$PATH"
+          } >> "$GITHUB_ENV"
+          echo '### Analysis tool versions' >> "$GITHUB_STEP_SUMMARY"
+          ipsw version 2>&1 | head -n 2 >> "$GITHUB_STEP_SUMMARY" || true
+          r2 -v 2>&1 | head -n 1 >> "$GITHUB_STEP_SUMMARY" || true
+          python3 --version >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Locate and safely extract IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$WORK_DIR/input" "$WORK_DIR/extracted" "$WORK_DIR/analysis"
+
+          requested="${INPUT_IPA_PATH:-app.ipa}"
+          if [[ "$requested" = /* ]]; then
+            candidate="$requested"
+          else
+            candidate="$GITHUB_WORKSPACE/$requested"
+          fi
+
+          if [[ ! -f "$candidate" ]]; then
+            candidate="$(find "$GITHUB_WORKSPACE" -maxdepth 5 -type f -name '*.ipa' -print -quit || true)"
+          fi
+          if [[ -z "$candidate" || ! -f "$candidate" ]]; then
+            echo '::error::没有找到 IPA。请把 IPA 放进仓库，或在 workflow_dispatch 中填写 ipa_path。'
+            exit 1
+          fi
+
+          echo "Using IPA: $(basename "$candidate")"
+          echo "IPA_FILE=$candidate" >> "$GITHUB_ENV"
+
+          # 使用 Python 校验 ZIP 内路径，避免将 ../ 路径写出解压目录。
+          python3 - "$candidate" "$WORK_DIR/extracted" <<'PY'
+          import pathlib, sys, zipfile
+          archive = pathlib.Path(sys.argv[1])
+          root = pathlib.Path(sys.argv[2]).resolve()
+          root.mkdir(parents=True, exist_ok=True)
+          with zipfile.ZipFile(archive) as zf:
+              for item in zf.infolist():
+                  name = pathlib.PurePosixPath(item.filename)
+                  if name.is_absolute() or ".." in name.parts:
+                      print(f"Skipping unsafe archive entry: {item.filename}")
+                      continue
+                  target = (root / pathlib.Path(*name.parts)).resolve()
+                  if target != root and root not in target.parents:
+                      print(f"Skipping out-of-root entry: {item.filename}")
+                      continue
+                  if item.is_dir():
+                      target.mkdir(parents=True, exist_ok=True)
+                      continue
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  with zf.open(item) as src, target.open("wb") as dst:
+                      while True:
+                          chunk = src.read(1024 * 1024)
+                          if not chunk:
+                              break
+                          dst.write(chunk)
+          PY
+
+          payload="$WORK_DIR/extracted/Payload"
+          if [[ ! -d "$payload" ]]; then
+            echo '::error::IPA 内不存在 Payload 目录，文件可能不是有效的 iOS IPA。'
+            exit 1
+          fi
+
+          app_dir="$(find "$payload" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          if [[ -z "$app_dir" ]]; then
+            echo '::error::Payload 中没有找到主 .app 包。'
+            exit 1
+          fi
+
+          info_plist="$app_dir/Info.plist"
+          executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$info_plist" 2>/dev/null || true)"
+          if [[ -z "$executable" || ! -f "$app_dir/$executable" ]]; then
+            echo '::error::无法通过 Info.plist 的 CFBundleExecutable 定位主程序。'
+            exit 1
+          fi
+
+          main_binary="$app_dir/$executable"
+          if ! file "$main_binary" | grep -q 'Mach-O'; then
+            echo '::error::CFBundleExecutable 不是可识别的 Mach-O 文件。'
+            file "$main_binary" || true
+            exit 1
+          fi
+
+          {
+            echo "APP_DIR=$app_dir"
+            echo "MAIN_BINARY=$main_binary"
+            echo "ANALYSIS_DIR=$WORK_DIR/analysis"
+          } >> "$GITHUB_ENV"
+
+          echo "### IPA identified" >> "$GITHUB_STEP_SUMMARY"
+          echo "- App bundle: \`$(basename "$app_dir")\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Executable: \`$executable\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Main binary: $(file -b "$main_binary")" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Extract app metadata, resources, signing and entitlements
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$ANALYSIS_DIR/metadata" "$ANALYSIS_DIR/signing"
+
+          "$PYTHON" - "$APP_DIR" "$ANALYSIS_DIR/metadata" <<'PY'
+          import collections, json, pathlib, plistlib, sys
+          app = pathlib.Path(sys.argv[1])
+          out = pathlib.Path(sys.argv[2])
+          out.mkdir(parents=True, exist_ok=True)
+
+          def read_plist(path):
+              try:
+                  with path.open('rb') as f:
+                      return plistlib.load(f)
+              except Exception:
+                  return {}
+
+          bundles = []
+          privacy_keys = []
+          for info_path in app.rglob('Info.plist'):
+              data = read_plist(info_path)
+              if not data:
+                  continue
+              parent = info_path.parent
+              bundles.append({
+                  'path': str(parent.relative_to(app)),
+                  'bundle_id': data.get('CFBundleIdentifier'),
+                  'name': data.get('CFBundleName'),
+                  'display_name': data.get('CFBundleDisplayName'),
+                  'executable': data.get('CFBundleExecutable'),
+                  'version': data.get('CFBundleShortVersionString'),
+                  'build': data.get('CFBundleVersion'),
+                  'minimum_os': data.get('MinimumOSVersion'),
+                  'platform': data.get('DTPlatformName'),
+                  'supported_platforms': data.get('CFBundleSupportedPlatforms'),
+                  'url_types': data.get('CFBundleURLTypes', []),
+                  'background_modes': data.get('UIBackgroundModes', []),
+                  'ats': data.get('NSAppTransportSecurity', {}),
+                  'permission_usage_keys': {
+                      k: v for k, v in data.items()
+                      if ('UsageDescription' in k or k.endswith('Tracking'))
+                  },
+              })
+
+          counts = collections.Counter()
+          total_bytes = 0
+          resources = []
+          for p in app.rglob('*'):
+              if not p.is_file():
+                  continue
+              try:
+                  size = p.stat().st_size
+              except OSError:
+                  size = 0
+              total_bytes += size
+              ext = p.suffix.lower() or '[no extension]'
+              counts[ext] += 1
+              if ext in {'.car', '.nib', '.storyboardc', '.strings', '.stringsdict', '.plist',
+                         '.sqlite', '.db', '.momd', '.xcdatamodeld', '.metallib', '.mlmodelc',
+                         '.png', '.jpg', '.jpeg', '.heic', '.json', '.html', '.js', '.wasm'}:
+                  resources.append({'path': str(p.relative_to(app)), 'bytes': size, 'type': ext})
+
+          result = {
+              'app_bundle': app.name,
+              'bundles': bundles,
+              'resource_file_count': sum(counts.values()),
+              'resource_total_bytes': total_bytes,
+              'file_type_counts': dict(sorted(counts.items())),
+              'notable_resources': resources,
+          }
+          (out / 'bundle_metadata.json').write_text(
+              json.dumps(result, ensure_ascii=False, indent=2, default=str), encoding='utf-8')
+          (out / 'resource_inventory.txt').write_text(
+              '\n'.join(f"{r['type']}\t{r['bytes']}\t{r['path']}" for r in resources), encoding='utf-8')
+
+          localized = {}
+          for p in app.rglob('*'):
+              if p.is_file() and p.suffix.lower() in {'.strings', '.stringsdict'}:
+                  try:
+                      with p.open('rb') as f:
+                          localized[str(p.relative_to(app))] = plistlib.load(f)
+                  except Exception:
+                      continue
+          (out / 'localized_strings.json').write_text(
+              json.dumps(localized, ensure_ascii=False, indent=2, default=str), encoding='utf-8')
+
+          md = ['# App / Bundle Metadata', '', f"- Main bundle: `{app.name}`",
+                f"- Bundle count: {len(bundles)}", f"- Total files: {result['resource_file_count']}",
+                f"- Total uncompressed bytes: {total_bytes}", '', '## Bundles']
+          for b in bundles:
+              md += ['', f"### {b['path']}", f"- Bundle ID: `{b.get('bundle_id')}`",
+                     f"- Executable: `{b.get('executable')}`",
+                     f"- Version / Build: `{b.get('version')}` / `{b.get('build')}`",
+                     f"- Minimum OS: `{b.get('minimum_os')}`",
+                     f"- URL Types: `{json.dumps(b.get('url_types', []), ensure_ascii=False)}`",
+                     f"- Background modes: `{json.dumps(b.get('background_modes', []), ensure_ascii=False)}`"]
+              if b.get('permission_usage_keys'):
+                  md.append('- Permission usage descriptions:')
+                  md.extend(f"  - `{k}`: {v}" for k, v in b['permission_usage_keys'].items())
+              if b.get('ats'):
+                  md.append(f"- App Transport Security: `{json.dumps(b['ats'], ensure_ascii=False)}`")
+          md += ['', '## File type counts', '']
+          md += [f"- `{k}`: {v}" for k, v in result['file_type_counts'].items()]
+          (out / 'bundle_metadata.md').write_text('\n'.join(md) + '\n', encoding='utf-8')
+          PY
+
+          # 导出签名摘要和 Entitlements；不将整个 provisioning profile（含设备/证书信息）放进 Artifact。
+          bundle_index=0
+          while IFS= read -r -d '' bundle; do
+            bundle_index=$((bundle_index + 1))
+            bundle_name="$(printf '%s' "${bundle#"$APP_DIR"/}" | sed 's#[^A-Za-z0-9._-]#_#g')"
+            codesign -dv --verbose=4 "$bundle" > "$ANALYSIS_DIR/signing/${bundle_index}_${bundle_name}_codesign.txt" 2>&1 || true
+            codesign -d --entitlements :- "$bundle" \
+              > "$ANALYSIS_DIR/signing/${bundle_index}_${bundle_name}_entitlements.plist" \
+              2> "$ANALYSIS_DIR/signing/${bundle_index}_${bundle_name}_entitlements_stderr.txt" || true
+          done < <(find "$APP_DIR" -type d \( -name '*.app' -o -name '*.appex' \) -print0)
+          if [[ -f "$APP_DIR/embedded.mobileprovision" ]]; then
+            if security cms -D -i "$APP_DIR/embedded.mobileprovision" > "$WORK_DIR/profile.plist" 2>/dev/null; then
+              "$PYTHON" - "$WORK_DIR/profile.plist" "$ANALYSIS_DIR/signing/profile_summary.json" <<'PY'
+          import datetime, json, plistlib, sys
+          try:
+              with open(sys.argv[1], 'rb') as f: p = plistlib.load(f)
+          except Exception: p = {}
+          ent = p.get('Entitlements', {})
+          summary = {
+              'Name': p.get('Name'),
+              'TeamName': p.get('TeamName'),
+              'TeamIdentifier': p.get('TeamIdentifier'),
+              'UUID': p.get('UUID'),
+              'CreationDate': str(p.get('CreationDate')),
+              'ExpirationDate': str(p.get('ExpirationDate')),
+              'ApplicationIdentifierPrefix': p.get('ApplicationIdentifierPrefix'),
+              'application-identifier': ent.get('application-identifier'),
+              'get-task-allow': ent.get('get-task-allow'),
+              'aps-environment': ent.get('aps-environment'),
+              'keychain-access-groups': ent.get('keychain-access-groups'),
+          }
+          with open(sys.argv[2], 'w', encoding='utf-8') as f:
+              json.dump(summary, f, ensure_ascii=False, indent=2)
+          PY
+            fi
+            rm -f "$WORK_DIR/profile.plist"
+          fi
+
+          find "$APP_DIR" -type f \( -name 'PrivacyInfo.xcprivacy' -o -name '*.entitlements' \) -print \
+            > "$ANALYSIS_DIR/signing/privacy_and_entitlement_files.txt" || true
+
+      - name: Inspect and extract compiled Assets.car catalogs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$ANALYSIS_DIR/assets"
+          car_index=0
+          while IFS= read -r -d '' car; do
+            car_index=$((car_index + 1))
+            relative="${car#"$APP_DIR"/}"
+            safe_name="$(printf '%s' "$relative" | sed 's#[^A-Za-z0-9._-]#_#g')"
+            out="$ANALYSIS_DIR/assets/${car_index}_${safe_name}"
+            mkdir -p "$out"
+            ipsw car "$car" --metadata-only --json > "$out/catalog_metadata.json" 2> "$out/metadata_errors.txt" || true
+            if [[ "${EXTRACT_ASSETS:-true}" == "true" ]]; then
+              # 尽可能解码受支持的 rendition；不支持的编码会保留在 extraction log 中。
+              ipsw car "$car" --render --apply-orientation --output "$out/renditions" \
+                --manifest "$out/extraction_manifest.json" > "$out/extraction.log" 2>&1 || true
+            else
+              echo 'Asset extraction disabled by workflow input.' > "$out/extraction.log"
+            fi
+          done < <(find "$APP_DIR" -type f -name '*.car' -print0)
+
+      - name: Analyze every Mach-O binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$ANALYSIS_DIR/macho" "$ANALYSIS_DIR/objc" "$ANALYSIS_DIR/swift" "$ANALYSIS_DIR/raw_binaries"
+
+          binary_count=0
+          while IFS= read -r -d '' binary; do
+            description="$(file -b "$binary" 2>/dev/null || true)"
+            [[ "$description" == *Mach-O* ]] || continue
+            binary_count=$((binary_count + 1))
+            relative="${binary#"$APP_DIR"/}"
+            safe_name="$(printf '%s' "$relative" | sed 's#[^A-Za-z0-9._-]#_#g')"
+            out="$ANALYSIS_DIR/macho/$safe_name"
+            mkdir -p "$out"
+
+            {
+              echo "Path: $relative"
+              echo "File: $description"
+              echo "Size: $(du -h "$binary" | awk '{print $1}')"
+              echo "SHA256: $(shasum -a 256 "$binary" | awk '{print $1}')"
+              echo "Architectures: $(lipo -archs "$binary" 2>/dev/null || echo unknown)"
+              echo
+              rabin2 -I "$binary" 2>&1 || true
+            } > "$out/binary_info.txt"
+
+            rabin2 -E "$binary" > "$out/exports.txt" 2>&1 || true
+            rabin2 -i "$binary" > "$out/imports.txt" 2>&1 || true
+            rabin2 -s "$binary" > "$out/symbols.txt" 2>&1 || true
+
+            archs="$(lipo -archs "$binary" 2>/dev/null || true)"
+            if [[ -z "$archs" ]]; then
+              archs="arm64"
+            fi
+            for arch in $archs; do
+              otool -arch "$arch" -hv "$binary" > "$out/header_${arch}.txt" 2>&1 || true
+              otool -arch "$arch" -l "$binary" > "$out/load_commands_${arch}.txt" 2>&1 || true
+              otool -arch "$arch" -L "$binary" > "$out/dependencies_${arch}.txt" 2>&1 || true
+              nm -arch "$arch" -m "$binary" > "$out/nm_${arch}.txt" 2>&1 || true
+              nm -arch "$arch" -u "$binary" > "$out/undefined_symbols_${arch}.txt" 2>&1 || true
+
+              # cryptid=1 通常表示该 Mach-O slice 仍处于加密状态；不尝试绕过加密。
+              grep -A 6 -E 'LC_ENCRYPTION_INFO(_64)?' "$out/load_commands_${arch}.txt" \
+                > "$out/encryption_${arch}.txt" || echo 'No LC_ENCRYPTION_INFO load command found.' > "$out/encryption_${arch}.txt"
+
+              ipsw macho info "$binary" --arch "$arch" --header --loads --ent --objc \
+                --objc-refs --symbols --sig --fixups --starts --demangle --json \
+                > "$out/ipsw_macho_${arch}.json" 2> "$out/ipsw_macho_${arch}.stderr.txt" || true
+
+              if [[ "${FULL_DISASSEMBLY:-true}" == "true" ]]; then
+                # 新系统常见 __TEXT_EXEC.__text；兼容旧布局时回退到 __TEXT.__text。
+                disassembly_written=false
+                for section in __TEXT_EXEC.__text __TEXT.__text; do
+                  if ipsw macho disass "$binary" --arch "$arch" --section "$section" --json --quiet \
+                    > "$out/disassembly_${arch}.json" 2> "$out/disassembly_${arch}.stderr.txt"; then
+                    if [[ -s "$out/disassembly_${arch}.json" ]]; then
+                      disassembly_written=true
+                      break
+                    fi
+                  fi
+                done
+                if [[ "$disassembly_written" != "true" ]]; then
+                  echo 'No disassembly generated; check encryption status and section names.' \
+                    > "$out/disassembly_${arch}.status.txt"
+                fi
+              fi
+
+              objc_dir="$ANALYSIS_DIR/objc/${safe_name}_${arch}"
+              swift_dir="$ANALYSIS_DIR/swift/${safe_name}_${arch}"
+              mkdir -p "$objc_dir/headers" "$swift_dir/headers"
+              ipsw class-dump "$binary" --arch "$arch" --headers --output "$objc_dir/headers" \
+                > "$objc_dir/class_dump.txt" 2>&1 || true
+              ipsw swift-dump "$binary" --arch "$arch" --demangle --extra --headers --output "$swift_dir/headers" \
+                > "$swift_dir/swift_dump.txt" 2>&1 || true
+
+              # r2 -A 先执行分析，再导出函数列表、交叉引用/导入导出等信息。
+              r2 -q -A -c 'iI; iE; ii; is; afl' "$binary" \
+                > "$out/radare2_${arch}.txt" 2>&1 || true
+            done
+
+            # 原始 strings 只在临时文件中处理；报告会对疑似凭证值进行启发式脱敏。
+            strings -a -n 5 "$binary" > "$out/.strings_raw.txt" 2>/dev/null || true
+            "$PYTHON" - "$out/.strings_raw.txt" "$out/strings_redacted.txt" "$out/strings_categories.json" "$out/security_indicators.json" <<'PY'
+          import collections, json, pathlib, re, sys
+          from urllib.parse import urlsplit, urlunsplit
+          raw, redacted, categories_out, indicators_out = map(pathlib.Path, sys.argv[1:])
+          patterns = {
+              'URLs': re.compile(r'https?://[^\s\"\'<>]+', re.I),
+              'API paths': re.compile(r'/(?:api|v[0-9]+|graphql|rest)/[^\s\"\'<>]*', re.I),
+              'Bundle identifiers': re.compile(r'\b[a-zA-Z][\w-]*(?:\.[a-zA-Z][\w-]*){2,}\b'),
+              'Crypto references': re.compile(r'\b(?:AES|RSA|CCCrypt|CommonCrypto|CryptoKit|SHA-?1|SHA-?256|SHA-?512|MD5|HMAC|ChaCha20|Curve25519)\b', re.I),
+              'SQL references': re.compile(r'\b(?:SELECT|INSERT|UPDATE|DELETE|CREATE TABLE|DROP TABLE)\b', re.I),
+          }
+          secret_re = re.compile(r'''(?i)((?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|passwd|secret|authorization)\s*[:=]\s*[\"']?)([^\s,;\"'&]{6,})''')
+          bearer_re = re.compile(r'(?i)(Bearer\s+)[A-Za-z0-9._~+/=-]{12,}')
+          jwt_re = re.compile(r'\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b')
+          query_secret_re = re.compile(r'(?i)([?&](?:access_token|refresh_token|token|api[_-]?key|secret|password)=)[^&\s]+')
+          common_key_re = re.compile(r'\b(?:AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk_live_[A-Za-z0-9]{16,})\b')
+          pem_begin_re = re.compile(r'-----BEGIN [A-Z ]*PRIVATE KEY-----')
+          pem_end_re = re.compile(r'-----END [A-Z ]*PRIVATE KEY-----')
+          categories = collections.defaultdict(list)
+          flags = collections.Counter()
+          cleaned = []
+          inside_private_key = False
+          try:
+              lines = raw.read_text(errors='ignore').splitlines()
+          except OSError:
+              lines = []
+          for line in lines[:200000]:
+              if inside_private_key:
+                  if pem_end_re.search(line):
+                      inside_private_key = False
+                  continue
+              if pem_begin_re.search(line):
+                  inside_private_key = True
+                  cleaned.append('[REDACTED_PRIVATE_KEY_BLOCK]')
+                  flags['possible_private_key_block'] += 1
+                  continue
+              if secret_re.search(line): flags['possible_hardcoded_credential'] += 1
+              if bearer_re.search(line): flags['possible_bearer_token'] += 1
+              if jwt_re.search(line): flags['possible_jwt'] += 1
+              if re.search(r'\b(?:ptrace|task_for_pid|sysctl)\b', line, re.I): flags['anti_debug_indicators'] += 1
+              if re.search(r'\b(?:frida|MSHookFunction|fishhook|Substrate)\b', line, re.I): flags['hooking_or_instrumentation_indicators'] += 1
+              if re.search(r'\b(?:jailbreak|Cydia|MobileSubstrate)\b', line, re.I): flags['jailbreak_detection_indicators'] += 1
+              if re.search(r'\b(?:MD5|DES|RC4|SHA1)\b', line, re.I): flags['legacy_crypto_references'] += 1
+              for name, regex in patterns.items():
+                  for match in regex.findall(line):
+                      if name == 'URLs':
+                          parts = urlsplit(match)
+                          match = urlunsplit((parts.scheme, parts.netloc, parts.path, '', ''))
+                      if len(categories[name]) < 1000 and match not in categories[name]:
+                          categories[name].append(match[:500])
+              line = secret_re.sub(r'\1[REDACTED]', line)
+              line = query_secret_re.sub(r'\1[REDACTED]', line)
+              line = bearer_re.sub(r'\1[REDACTED]', line)
+              line = jwt_re.sub('[REDACTED_JWT]', line)
+              line = common_key_re.sub('[REDACTED_API_KEY]', line)
+              cleaned.append(line)
+          redacted.write_text('\n'.join(cleaned) + ('\n' if cleaned else ''), encoding='utf-8')
+          categories_out.write_text(json.dumps(categories, ensure_ascii=False, indent=2), encoding='utf-8')
+          indicators_out.write_text(json.dumps(dict(flags), ensure_ascii=False, indent=2), encoding='utf-8')
+          raw.unlink(missing_ok=True)
+          PY
+
+            if [[ "${INCLUDE_RAW_BINARIES:-false}" == "true" ]]; then
+              cp "$binary" "$ANALYSIS_DIR/raw_binaries/${safe_name}"
+            fi
+          done < <(find "$APP_DIR" -type f -print0)
+
+          if [[ "$binary_count" -eq 0 ]]; then
+            echo '::error::没有发现 Mach-O 二进制文件。'
+            exit 1
+          fi
+          echo "MACHO_BINARY_COUNT=$binary_count" >> "$GITHUB_ENV"
+          echo "Mach-O binaries analyzed: $binary_count"
+
+      - name: Generate optional Frida runtime inventory script
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$ANALYSIS_DIR/frida_runtime_inventory.js" <<'JS'
+          // 仅用于你拥有或获准测试的设备/应用。
+          // 该脚本只枚举模块和 Objective-C 类，不自动 Hook 方法或读取业务数据。
+          'use strict';
+          setImmediate(function () {
+            console.log('[*] Frida runtime inventory started');
+            Process.enumerateModules().forEach(function (m) {
+              send({ type: 'module', name: m.name, base: m.base.toString(), size: m.size, path: m.path });
+            });
+            if (ObjC.available) {
+              ObjC.enumerateLoadedClasses({
+                onMatch: function (name, owner) {
+                  send({ type: 'objc-class', name: name, owner: owner });
+                },
+                onComplete: function () {
+                  console.log('[+] Objective-C class enumeration complete');
+                }
+              });
+            } else {
+              console.log('[i] Objective-C runtime is not available in this process');
+            }
+            console.log('[+] Runtime inventory finished');
+          });
+          JS
+
+      - name: Generate reverse engineering report
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$PYTHON" - "$ANALYSIS_DIR" "$APP_DIR" "$MACHO_BINARY_COUNT" <<'PY'
+          import collections, json, pathlib, sys
+          root, app, count = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), int(sys.argv[3])
+          meta_path = root / 'metadata' / 'bundle_metadata.json'
+          meta = json.loads(meta_path.read_text(encoding='utf-8')) if meta_path.exists() else {}
+          report = [
+              '# iOS IPA 静态逆向分析报告', '',
+              '> 本报告由静态分析生成。符号/类/Swift 元数据的缺失不代表功能不存在；加密、优化、符号剥离和运行时生成代码都会限制可见性。', '',
+              '## 1. App 基本信息',
+              f'- App 包：`{app.name}`',
+              f'- Bundle 数量：{len(meta.get("bundles", []))}',
+              f'- 文件总数：{meta.get("resource_file_count", 0)}',
+              f'- Mach-O 二进制数量：{count}',
+              f'- 未压缩资源大小：{meta.get("resource_total_bytes", 0)} bytes', '',
+              '## 2. Bundle / 版本 / 权限',
+          ]
+          for b in meta.get('bundles', []):
+              report += ['', f"### {b.get('path')}",
+                         f"- Bundle ID：`{b.get('bundle_id')}`",
+                         f"- Executable：`{b.get('executable')}`",
+                         f"- Version / Build：`{b.get('version')}` / `{b.get('build')}`",
+                         f"- Minimum OS：`{b.get('minimum_os')}`",
+                         f"- URL Types：`{json.dumps(b.get('url_types', []), ensure_ascii=False)}`",
+                         f"- Background Modes：`{json.dumps(b.get('background_modes', []), ensure_ascii=False)}`",
+                         f"- ATS：`{json.dumps(b.get('ats', {}), ensure_ascii=False)}`"]
+              for k, v in b.get('permission_usage_keys', {}).items():
+                  report.append(f"- {k}：{v}")
+          report += ['', '## 3. Mach-O 文件分析', '']
+          macho_files = sorted((root / 'macho').glob('*/binary_info.txt'))
+          for info in macho_files:
+              report.append(f"- `{info.parent.name}`")
+          report += ['', '## 4. 字符串与安全线索', '']
+          indicator_totals = collections.Counter()
+          for indicator_file in root.rglob('security_indicators.json'):
+              try:
+                  indicator_totals.update(json.loads(indicator_file.read_text(encoding='utf-8')))
+              except Exception:
+                  pass
+          if indicator_totals:
+              report.extend(f"- `{name}`：{value} 条（启发式命中，并非已确认漏洞）" for name, value in sorted(indicator_totals.items()))
+          else:
+              report.append('- 未发现明显的静态指标；这不代表不存在相关行为。')
+          report += ['', '## 5. Objective-C / Swift 元数据',
+                     f"- Objective-C dump 目录：`objc/`（若有运行时元数据且未被剥离，可生成头文件）",
+                     f"- Swift dump 目录：`swift/`（若 Swift 元数据可识别，可生成类型/协议信息）",
+                     '', '## 6. 签名与安全配置',
+                     '- 签名摘要：`signing/codesign_details.txt`',
+                     '- Entitlements：`signing/entitlements.plist`',
+                     '- Provisioning Profile 摘要：`signing/profile_summary.json`（若 IPA 含 profile）',
+                     '- 字符串输出已做常见凭证模式的启发式脱敏；仍需人工检查，脱敏不能保证识别所有秘密。',
+                     '- `cryptid=1` 表示对应 slice 标记为加密；本流程只检测，不尝试解密或绕过保护。',
+                     '', '## 7. 输出目录说明',
+                     '- `macho/`：Mach-O 头、Load Commands、依赖、导入/导出、符号、radare2 分析、加密标记及完整反汇编 JSON（启用时）',
+                     '- `objc/`：Objective-C 类 dump 与可导出的 headers',
+                     '- `swift/`：Swift 元数据 dump、demangle 信息及 headers（若工具能识别）',
+                     '- `metadata/`：Bundle 信息、资源类型统计、资源清单和可解析的 `.strings` / `.stringsdict` 本地化文本',
+                     '- `assets/`：Assets.car 元数据、可解码的图像/矢量/文档 rendition 和提取日志',
+                     '- `signing/`：签名、Entitlements、隐私清单路径和 profile 摘要',
+                     '- `raw_binaries/`：仅在手动启用 include_raw_binaries 时包含原始 Mach-O',
+                     '', '## 8. 重要限制',
+                     '- 这不是源码还原器，不能恢复原始变量名、注释、完整控制流结构或服务端代码。',
+                     '- App Store/FairPlay 加密二进制、符号剥离、Swift 优化、混淆及运行时解密会造成分析缺口。',
+                     '- Frida 动态分析需要在你有权测试的设备/模拟环境中运行；GitHub 托管 runner 不会自动连接你的 iPhone。',
+                     '- 安全指标是线索，不等于已确认漏洞；请结合源码、运行时和服务端配置验证。', '']
+          (root / 'ULTIMATE_REPORT.md').write_text('\n'.join(report), encoding='utf-8')
+          PY
+
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ## Reverse analysis completed
+          - Mach-O binaries analyzed: **$MACHO_BINARY_COUNT**
+          - Main app: \`$(basename "$APP_DIR")\`
+          - Report: \`ULTIMATE_REPORT.md\`
+          - Artifact: **ios-ipa-reverse-analysis**
+          EOF
+
+      - name: Upload analysis artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ios-ipa-reverse-analysis
+          path: ${{ runner.temp }}/ipa-reverse/analysis/
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 14
