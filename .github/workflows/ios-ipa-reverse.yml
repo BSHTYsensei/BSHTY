@@ -2,9 +2,7 @@ name: iOS IPA Reverse Analysis
 
 on:
   push:
-    paths:
-      - '**/*.ipa'
-      - '.github/workflows/ios-ipa-reverse.yml'
+    
   workflow_dispatch:
     inputs:
       ipa_path:
